@@ -42,6 +42,7 @@ Al abrir se muestran solo los pedidos del día; al día siguiente la lista empie
 | `B` | Borrar el último pedido (si te equivocaste de plataforma) |
 | `I` | Configurar impresora |
 | `P` | Probar conexión con la impresora |
+| `D` | Diagnóstico de impresora (prueba canales y formatos, guarda el que funciona) |
 | `L` | Limpiar pantalla |
 
 ## Impresora térmica Bluetooth

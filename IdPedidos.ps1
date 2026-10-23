@@ -25,7 +25,7 @@ $Plataformas = [ordered]@{
 }
 
 function Get-Config {
-    $default = [pscustomobject]@{ Modo = 'ninguna'; Impresora = ''; Puerto = ''; Baudios = 9600; Bluetooth = ''; BluetoothNombre = ''; Negocio = ''; Ancho = 32 }
+    $default = [pscustomobject]@{ Modo = 'ninguna'; Impresora = ''; Puerto = ''; Baudios = 9600; Bluetooth = ''; BluetoothNombre = ''; Canal = 0; Formato = 'escpos'; Negocio = ''; Ancho = 32 }
     if (Test-Path $ConfigPath) {
         try {
             $cfg = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -176,40 +176,74 @@ using System.Net;
 using System.Net.Sockets;
 public class IdPedidosBtEndPoint : EndPoint {
     const int AF_BTH = 32;
-    static readonly Guid SPP = new Guid("00001101-0000-1000-8000-00805F9B34FB");
+    public static readonly Guid SPP = new Guid("00001101-0000-1000-8000-00805F9B34FB");
     public ulong Address;
-    public IdPedidosBtEndPoint(ulong address) { Address = address; }
+    public int Channel;   // 0 = buscar el servicio serie (SPP) automáticamente; 1-30 = canal RFCOMM fijo
+    public IdPedidosBtEndPoint(ulong address, int channel) { Address = address; Channel = channel; }
     public override AddressFamily AddressFamily { get { return (AddressFamily)AF_BTH; } }
     public override SocketAddress Serialize() {
         // SOCKADDR_BTH (empaquetado): family(2) + btAddr(8) + serviceClassId(16) + port(4)
         SocketAddress sa = new SocketAddress((AddressFamily)AF_BTH, 30);
         byte[] a = BitConverter.GetBytes(Address);
         for (int i = 0; i < 8; i++) sa[2 + i] = a[i];
-        byte[] g = SPP.ToByteArray();
-        for (int i = 0; i < 16; i++) sa[10 + i] = g[i];
+        if (Channel <= 0) {
+            byte[] g = SPP.ToByteArray();
+            for (int i = 0; i < 16; i++) sa[10 + i] = g[i];
+        } else {
+            byte[] c = BitConverter.GetBytes((uint)Channel);
+            for (int i = 0; i < 4; i++) sa[26 + i] = c[i];
+        }
         return sa;
     }
     public override EndPoint Create(SocketAddress sa) { return this; }
 }
 public static class IdPedidosBluetooth {
-    static Socket Connect(string mac, int timeoutMs) {
+    static string Explicar(SocketException e) {
+        switch (e.ErrorCode) {
+            case 10050: return "el Bluetooth de la PC esta apagado o no hay adaptador";
+            case 10051: case 10065: return "no se encuentra el aparato (encendido, Bluetooth activo y cerca?)";
+            case 10060: return "el aparato no contesto a tiempo (encendido y cerca?)";
+            case 10061: return "el aparato rechazo la conexion (servicio de impresion no disponible)";
+            case 10064: return "el aparato no esta disponible (apagado, fuera de alcance o no emparejado)";
+            case 10108: return "el aparato no ofrece el servicio de puerto serie en ese canal";
+            case 10013: return "permiso denegado (vuelve a emparejar el aparato)";
+            default: return e.Message;
+        }
+    }
+    // Conexión síncrona en un hilo aparte para poder cortar por tiempo
+    static Socket Connect(string mac, int channel, int timeoutMs) {
         ulong addr = Convert.ToUInt64(mac.Replace(":", "").Replace("-", ""), 16);
         Socket s = new Socket((AddressFamily)32, SocketType.Stream, (ProtocolType)3);
-        IAsyncResult r = s.BeginConnect(new IdPedidosBtEndPoint(addr), null, null);
-        if (!r.AsyncWaitHandle.WaitOne(timeoutMs)) { s.Close(); throw new Exception("El dispositivo Bluetooth no respondio (esta encendido y cerca?)"); }
-        try { s.EndConnect(r); } catch { s.Close(); throw; }
+        Exception error = null;
+        System.Threading.Thread t = new System.Threading.Thread(delegate() {
+            try { s.Connect(new IdPedidosBtEndPoint(addr, channel)); } catch (Exception ex) { error = ex; }
+        });
+        t.IsBackground = true;
+        t.Start();
+        if (!t.Join(timeoutMs)) { try { s.Close(); } catch { } throw new Exception("el aparato no contesto en " + (timeoutMs / 1000) + " s (encendido y cerca?)"); }
+        if (error != null) {
+            try { s.Close(); } catch { }
+            SocketException se = error as SocketException;
+            if (se != null) throw new Exception(Explicar(se) + " [codigo " + se.ErrorCode + "]");
+            throw new Exception(error.Message);
+        }
         return s;
     }
-    public static void Send(string mac, byte[] data, int timeoutMs) {
-        using (Socket s = Connect(mac, timeoutMs)) {
-            s.Send(data);
-            System.Threading.Thread.Sleep(800);
-            s.Shutdown(SocketShutdown.Both);
+    public static void Send(string mac, int channel, byte[] data, int timeoutMs) {
+        using (Socket s = Connect(mac, channel, timeoutMs)) {
+            int enviado = 0;
+            while (enviado < data.Length) {
+                int n = Math.Min(256, data.Length - enviado);   // en trozos pequeños, como lo hacen los celulares
+                enviado += s.Send(data, enviado, n, SocketFlags.None);
+                System.Threading.Thread.Sleep(30);
+            }
+            System.Threading.Thread.Sleep(2500);               // dar tiempo a que el aparato imprima antes de cortar
+            try { s.Shutdown(SocketShutdown.Both); } catch { }
         }
     }
     // Solo conecta y desconecta, sin imprimir nada
-    public static void Test(string mac, int timeoutMs) {
-        using (Socket s = Connect(mac, timeoutMs)) { s.Shutdown(SocketShutdown.Both); }
+    public static void Test(string mac, int channel, int timeoutMs) {
+        using (Socket s = Connect(mac, channel, timeoutMs)) { try { s.Shutdown(SocketShutdown.Both); } catch { } }
     }
 }
 '@
@@ -238,6 +272,67 @@ function Get-BluetoothEmparejados {
     return @($lista | Sort-Object Mac -Unique)
 }
 
+$LogPath = Join-Path $AppDir 'diagnostico.txt'
+function Write-Log([string]$texto) {
+    try { Add-Content -Path $LogPath -Encoding UTF8 -Value ('{0}  {1}' -f (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $texto) } catch { }
+}
+
+# Prueba varias formas de conectar con la impresora Bluetooth y guarda la que funcione
+function Start-Diagnostico {
+    $cfg = Get-Config
+    Write-Host ''
+    Write-Host ' DIAGNÓSTICO DE IMPRESORA' -ForegroundColor Cyan
+    Write-Log '===== Diagnóstico ====='
+    $linea = { param($t, $c) Write-Host " $t" -ForegroundColor $c; Write-Log $t }
+    & $linea ("Windows: {0}  PowerShell: {1}" -f [Environment]::OSVersion.Version, $PSVersionTable.PSVersion) Gray
+    & $linea ("Configuración: modo={0} disp={1} [{2}] canal={3} puerto={4} impresora={5}" -f $cfg.Modo, $cfg.BluetoothNombre, $cfg.Bluetooth, $cfg.Canal, $cfg.Puerto, $cfg.Impresora) Gray
+    try {
+        foreach ($r in Get-PnpDevice -Class Bluetooth -ErrorAction Stop | Where-Object { $_.InstanceId -notmatch 'DEV_' } | Select-Object -First 3) {
+            & $linea ("Adaptador Bluetooth: {0} ({1})" -f $r.FriendlyName, $r.Status) Gray
+        }
+    } catch { }
+    $bts = Get-BluetoothEmparejados
+    & $linea ("Dispositivos emparejados: {0}" -f (($bts | ForEach-Object { "$($_.Nombre) [$($_.Mac)]" }) -join ', ')) Gray
+    $puertos = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object -Unique)
+    & $linea ("Puertos COM: {0}" -f $(if ($puertos) { $puertos -join ', ' } else { 'ninguno' })) Gray
+
+    if ($cfg.Modo -ne 'bt' -or -not $cfg.Bluetooth) {
+        & $linea 'La impresora no está en modo Bluetooth directo. Escribe I y elige 1.' Yellow
+        return
+    }
+    $prueba = [pscustomobject]@{ Fecha = (Get-Date).ToString('dd/MM/yyyy'); Hora = (Get-Date).ToString('HH:mm:ss'); ID = 'PRUEBA-123'; Plataforma = 'PedidosYa' }
+    $canales = @(0) + (1..12)
+    foreach ($c in $canales) {
+        $desc = $(if ($c -eq 0) { 'servicio serie (SPP)' } else { "canal $c" })
+        Write-Host (" Probando {0}... " -f $desc) -NoNewline
+        try {
+            [IdPedidosBluetooth]::Test($cfg.Bluetooth, $c, 12000)
+            Write-Host 'CONECTÓ' -ForegroundColor Green
+            Write-Log "$desc : conectó"
+            # Conectó: probar los dos formatos de datos
+            foreach ($f in @('escpos', 'texto')) {
+                $cfg.Formato = $f
+                $nombreF = $(if ($f -eq 'escpos') { 'comandos de impresora (ESC/POS)' } else { 'texto simple' })
+                Write-Host "   Enviando ticket de prueba en $nombreF..." -NoNewline
+                try { [IdPedidosBluetooth]::Send($cfg.Bluetooth, $c, (New-Ticket $prueba $cfg), 12000); Write-Host ' enviado' -ForegroundColor Green }
+                catch { Write-Host " $($_.Exception.Message)" -ForegroundColor Yellow; Write-Log "$desc / $f : $($_.Exception.Message)"; continue }
+                if ((Read-Host '   ¿Salió el ticket impreso en el aparato? (S/N)') -match '^[sS]') {
+                    $cfg.Canal = $c; Save-Config $cfg
+                    & $linea "Funciona con $desc en $nombreF. Configuración guardada." Green
+                    return
+                }
+                Write-Log "$desc / $f : enviado pero NO imprimió"
+            }
+        } catch {
+            Write-Host $_.Exception.Message -ForegroundColor Yellow
+            Write-Log "$desc : $($_.Exception.Message)"
+            if ($c -eq 0 -and $_.Exception.Message -match 'codigo 1005[01]') { break }   # Bluetooth de la PC apagado: no tiene caso seguir
+        }
+    }
+    & $linea 'No se logró imprimir. Envía el archivo diagnostico.txt (se abrirá ahora).' Yellow
+    try { Start-Process notepad.exe $LogPath } catch { }
+}
+
 # Comprueba (sin imprimir) que la impresora responde; el resultado se muestra en el encabezado
 $script:EstadoImpresora = ''
 function Test-Impresora {
@@ -245,8 +340,11 @@ function Test-Impresora {
     switch ($cfg.Modo) {
         'bt' {
             Write-Host (' Conectando con {0}...' -f $cfg.BluetoothNombre) -ForegroundColor DarkGray
-            try { [IdPedidosBluetooth]::Test($cfg.Bluetooth, 8000); $script:EstadoImpresora = "OK|$($cfg.BluetoothNombre): conectada" }
-            catch { $script:EstadoImpresora = "ERR|$($cfg.BluetoothNombre): no responde (enciende el Bluetooth del aparato y escribe P)" }
+            try { [IdPedidosBluetooth]::Test($cfg.Bluetooth, [int]$cfg.Canal, 10000); $script:EstadoImpresora = "OK|$($cfg.BluetoothNombre): conectada" }
+            catch {
+                Write-Log "Prueba de conexión: $($_.Exception.Message)"
+                $script:EstadoImpresora = "ERR|$($cfg.BluetoothNombre): $($_.Exception.Message)  -> escribe D para diagnóstico"
+            }
         }
         'windows' { $script:EstadoImpresora = "OK|$($cfg.Impresora)" }
         'com'     { $script:EstadoImpresora = "OK|$($cfg.Puerto)" }
@@ -305,6 +403,14 @@ function New-Ticket($reg, $cfg) {
     $ancho = [int]$cfg.Ancho
     if ($ancho -lt 24) { $ancho = 32 }
 
+    # Formato 'texto': solo letras y saltos de línea, sin comandos de impresora
+    if ($cfg.Formato -eq 'texto') {
+        if ($cfg.Negocio) { & $txt $cfg.Negocio }
+        foreach ($l in (Format-Recuadro $reg $ancho)) { & $txt $l }
+        & $add @(0x0A, 0x0A, 0x0A, 0x0A)
+        return ,$b.ToArray()
+    }
+
     & $add @($ESC, 0x40)                 # inicializar
     & $add @($ESC, 0x61, 0)              # alineado a la izquierda (el recuadro ocupa todo el ancho)
     if ($cfg.Negocio) { & $add @($ESC, 0x61, 1, $ESC, 0x45, 1); & $txt $cfg.Negocio; & $add @($ESC, 0x45, 0, $ESC, 0x61, 0) }
@@ -325,8 +431,8 @@ function Send-Ticket($reg) {
     $bytes = New-Ticket $reg $cfg
     try {
         if ($cfg.Modo -eq 'bt') {
-            try { [IdPedidosBluetooth]::Send($cfg.Bluetooth, $bytes, 10000) }
-            catch { Start-Sleep -Seconds 1; [IdPedidosBluetooth]::Send($cfg.Bluetooth, $bytes, 10000) }   # segundo intento
+            try { [IdPedidosBluetooth]::Send($cfg.Bluetooth, [int]$cfg.Canal, $bytes, 15000) }
+            catch { Start-Sleep -Seconds 2; [IdPedidosBluetooth]::Send($cfg.Bluetooth, [int]$cfg.Canal, $bytes, 15000) }   # segundo intento
         } elseif ($cfg.Modo -eq 'windows') {
             [IdPedidosRawPrinter]::Send($cfg.Impresora, $bytes)
         } elseif ($cfg.Modo -eq 'com') {
@@ -337,6 +443,7 @@ function Send-Ticket($reg) {
         }
         Write-Host '   Impreso.' -ForegroundColor DarkGray
     } catch {
+        Write-Log "No se pudo imprimir $($reg.ID): $($_.Exception.Message)"
         Write-Host "   NO SE PUDO IMPRIMIR: $($_.Exception.Message)" -ForegroundColor Yellow
         Write-Host '   (El pedido SI quedó guardado. Revisa el Bluetooth y usa R para reimprimir.)' -ForegroundColor Yellow
     }
@@ -360,9 +467,9 @@ function Set-Impresora {
             $n = Read-Host ' Número del dispositivo (o escribe la MAC, ej. 00:11:22:AA:BB:CC)'
             $hex = ($n -replace '[:\-\s]', '').ToUpper()
             if ($n -match '^\d+$' -and [int]$n -ge 1 -and [int]$n -le $bts.Count) {
-                $cfg.Modo = 'bt'; $cfg.Bluetooth = $bts[[int]$n - 1].Mac; $cfg.BluetoothNombre = $bts[[int]$n - 1].Nombre
+                $cfg.Modo = 'bt'; $cfg.Canal = 0; $cfg.Bluetooth = $bts[[int]$n - 1].Mac; $cfg.BluetoothNombre = $bts[[int]$n - 1].Nombre
             } elseif ($hex -match '^[0-9A-F]{12}$') {
-                $cfg.Modo = 'bt'; $cfg.Bluetooth = $hex; $cfg.BluetoothNombre = $hex
+                $cfg.Modo = 'bt'; $cfg.Canal = 0; $cfg.Bluetooth = $hex; $cfg.BluetoothNombre = $hex
             } else { Write-Host ' Opción inválida.' -ForegroundColor Yellow; return }
         }
         '2' {
@@ -436,7 +543,7 @@ function Show-Encabezado {
     Write-Host '--------------------------------------------------------------' -ForegroundColor DarkCyan
     Write-Host ' Clic derecho = pegar ID  |  ENTER vacío = usar lo copiado' -ForegroundColor DarkGray
     Write-Host ' H = historial   R = reimprimir último   B = borrar último' -ForegroundColor DarkGray
-    Write-Host ' I = configurar impresora   P = probar conexión   L = limpiar' -ForegroundColor DarkGray
+    Write-Host ' I = configurar impresora   P = probar   D = diagnóstico' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -536,6 +643,7 @@ while ($true) {
         '^[hH]$' { Show-Historial; Show-Encabezado; continue }
         '^[iI]$' { Set-Impresora; Test-Impresora; Start-Sleep -Seconds 1; Show-Encabezado; continue }
         '^[pP]$' { Test-Impresora; Show-Encabezado; continue }
+        '^[dD]$' { Start-Diagnostico; Read-Host ' ENTER para volver' | Out-Null; Test-Impresora; Show-Encabezado; continue }
         '^[lL]$' { Show-Encabezado; continue }
         '^[rR]$' {
             $regs = Read-Day (Get-DayFile (Get-Date))
@@ -552,7 +660,7 @@ while ($true) {
             continue
         }
     }
-    if ($entrada.Trim() -match '^[hHiIlLrRbBpP]$') { continue }
+    if ($entrada.Trim() -match '^[hHiIlLrRbBpPdD]$') { continue }
 
     $id = Normalize-Id $entrada
     if (-not $id) {
