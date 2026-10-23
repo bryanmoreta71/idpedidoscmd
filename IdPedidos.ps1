@@ -25,7 +25,7 @@ $Plataformas = [ordered]@{
 }
 
 function Get-Config {
-    $default = [pscustomobject]@{ Modo = 'ninguna'; Impresora = ''; Puerto = ''; Baudios = 9600; Negocio = ''; Ancho = 32 }
+    $default = [pscustomobject]@{ Modo = 'ninguna'; Impresora = ''; Puerto = ''; Baudios = 9600; Bluetooth = ''; BluetoothNombre = ''; Negocio = ''; Ancho = 32 }
     if (Test-Path $ConfigPath) {
         try {
             $cfg = Get-Content $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -128,6 +128,7 @@ function Normalize-Id([string]$texto) {
 
 # --------------------------------------------------------------------------
 # Impresión ESC/POS (impresora térmica Bluetooth)
+#   Modo 'bt'     : Bluetooth directo (SPP/RFCOMM), p. ej. Sunmi V2 Pro de PedidosYa
 #   Modo 'windows': impresora instalada en Windows (envío RAW)
 #   Modo 'com'    : puerto COM serie de Bluetooth (SPP)
 # --------------------------------------------------------------------------
@@ -167,6 +168,67 @@ public static class IdPedidosRawPrinter {
     }
 }
 '@
+
+# Conexión Bluetooth RFCOMM sin puerto COM (Winsock AF_BTH), perfil serie SPP
+Add-Type -TypeDefinition @'
+using System;
+using System.Net;
+using System.Net.Sockets;
+public class IdPedidosBtEndPoint : EndPoint {
+    const int AF_BTH = 32;
+    static readonly Guid SPP = new Guid("00001101-0000-1000-8000-00805F9B34FB");
+    public ulong Address;
+    public IdPedidosBtEndPoint(ulong address) { Address = address; }
+    public override AddressFamily AddressFamily { get { return (AddressFamily)AF_BTH; } }
+    public override SocketAddress Serialize() {
+        // SOCKADDR_BTH (empaquetado): family(2) + btAddr(8) + serviceClassId(16) + port(4)
+        SocketAddress sa = new SocketAddress((AddressFamily)AF_BTH, 30);
+        byte[] a = BitConverter.GetBytes(Address);
+        for (int i = 0; i < 8; i++) sa[2 + i] = a[i];
+        byte[] g = SPP.ToByteArray();
+        for (int i = 0; i < 16; i++) sa[10 + i] = g[i];
+        return sa;
+    }
+    public override EndPoint Create(SocketAddress sa) { return this; }
+}
+public static class IdPedidosBluetooth {
+    public static void Send(string mac, byte[] data, int timeoutMs) {
+        ulong addr = Convert.ToUInt64(mac.Replace(":", "").Replace("-", ""), 16);
+        using (Socket s = new Socket((AddressFamily)32, SocketType.Stream, (ProtocolType)3)) {
+            IAsyncResult r = s.BeginConnect(new IdPedidosBtEndPoint(addr), null, null);
+            if (!r.AsyncWaitHandle.WaitOne(timeoutMs)) { s.Close(); throw new Exception("El dispositivo Bluetooth no respondio (esta encendido y cerca?)"); }
+            s.EndConnect(r);
+            s.Send(data);
+            System.Threading.Thread.Sleep(800);
+            s.Shutdown(SocketShutdown.Both);
+        }
+    }
+}
+'@
+
+# Dispositivos Bluetooth emparejados con esta PC: MAC + nombre
+function Get-BluetoothEmparejados {
+    $lista = @()
+    $raiz = 'HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices'
+    if (Test-Path $raiz) {
+        foreach ($k in Get-ChildItem $raiz -ErrorAction SilentlyContinue) {
+            $nombre = ''
+            try {
+                $bytes = (Get-ItemProperty $k.PSPath -Name Name -ErrorAction Stop).Name
+                $nombre = ([Text.Encoding]::UTF8.GetString($bytes)).Trim([char]0)
+            } catch { }
+            $lista += [pscustomobject]@{ Mac = $k.PSChildName.ToUpper(); Nombre = $(if ($nombre) { $nombre } else { '(sin nombre)' }) }
+        }
+    }
+    if ($lista.Count -eq 0) {
+        try {
+            foreach ($d in Get-PnpDevice -Class Bluetooth -ErrorAction Stop) {
+                if ($d.InstanceId -match 'DEV_([0-9A-F]{12})') { $lista += [pscustomobject]@{ Mac = $Matches[1]; Nombre = $d.FriendlyName } }
+            }
+        } catch { }
+    }
+    return @($lista | Sort-Object Mac -Unique)
+}
 
 function Remove-Acentos([string]$s) {
     $n = $s.Normalize([Text.NormalizationForm]::FormD)
@@ -238,7 +300,10 @@ function Send-Ticket($reg) {
     }
     $bytes = New-Ticket $reg $cfg
     try {
-        if ($cfg.Modo -eq 'windows') {
+        if ($cfg.Modo -eq 'bt') {
+            try { [IdPedidosBluetooth]::Send($cfg.Bluetooth, $bytes, 10000) }
+            catch { Start-Sleep -Seconds 1; [IdPedidosBluetooth]::Send($cfg.Bluetooth, $bytes, 10000) }   # segundo intento
+        } elseif ($cfg.Modo -eq 'windows') {
             [IdPedidosRawPrinter]::Send($cfg.Impresora, $bytes)
         } elseif ($cfg.Modo -eq 'com') {
             $sp = New-Object System.IO.Ports.SerialPort $cfg.Puerto, ([int]$cfg.Baudios)
@@ -256,13 +321,27 @@ function Send-Ticket($reg) {
 function Set-Impresora {
     Write-Host ''
     Write-Host ' CONFIGURAR IMPRESORA TÉRMICA' -ForegroundColor Cyan
-    Write-Host ' 1. Impresora instalada en Windows (recomendado)'
-    Write-Host ' 2. Puerto COM Bluetooth (SPP)'
-    Write-Host ' 3. Sin impresora'
+    Write-Host ' 1. Bluetooth directo (Sunmi V2 Pro de PedidosYa u otra térmica) - recomendado'
+    Write-Host ' 2. Impresora instalada en Windows'
+    Write-Host ' 3. Puerto COM Bluetooth (SPP)'
+    Write-Host ' 4. Sin impresora'
     $op = Read-Host ' Opción'
     $cfg = Get-Config
     switch ($op) {
         '1' {
+            Write-Host ' (Primero empareja el aparato en Configuración > Bluetooth y dispositivos)' -ForegroundColor DarkGray
+            $bts = Get-BluetoothEmparejados
+            for ($i = 0; $i -lt $bts.Count; $i++) { Write-Host (' {0}. {1}   [{2}]' -f ($i + 1), $bts[$i].Nombre, ($bts[$i].Mac -replace '(..)(?!$)', '$1:')) }
+            if ($bts.Count -eq 0) { Write-Host ' No se encontraron dispositivos emparejados.' -ForegroundColor Yellow }
+            $n = Read-Host ' Número del dispositivo (o escribe la MAC, ej. 00:11:22:AA:BB:CC)'
+            $hex = ($n -replace '[:\-\s]', '').ToUpper()
+            if ($n -match '^\d+$' -and [int]$n -ge 1 -and [int]$n -le $bts.Count) {
+                $cfg.Modo = 'bt'; $cfg.Bluetooth = $bts[[int]$n - 1].Mac; $cfg.BluetoothNombre = $bts[[int]$n - 1].Nombre
+            } elseif ($hex -match '^[0-9A-F]{12}$') {
+                $cfg.Modo = 'bt'; $cfg.Bluetooth = $hex; $cfg.BluetoothNombre = $hex
+            } else { Write-Host ' Opción inválida.' -ForegroundColor Yellow; return }
+        }
+        '2' {
             $lista = @(Get-CimInstance Win32_Printer | Select-Object -ExpandProperty Name)
             if ($lista.Count -eq 0) { Write-Host ' No hay impresoras instaladas.' -ForegroundColor Yellow; return }
             for ($i = 0; $i -lt $lista.Count; $i++) { Write-Host (' {0}. {1}' -f ($i + 1), $lista[$i]) }
@@ -271,7 +350,7 @@ function Set-Impresora {
                 $cfg.Modo = 'windows'; $cfg.Impresora = $lista[[int]$n - 1]
             } else { Write-Host ' Opción inválida.' -ForegroundColor Yellow; return }
         }
-        '2' {
+        '3' {
             $puertos = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object -Unique)
             Write-Host (' Puertos disponibles: {0}' -f ($(if ($puertos) { $puertos -join ', ' } else { 'ninguno' })))
             $p = Read-Host ' Puerto (ej. COM5)'
@@ -279,7 +358,7 @@ function Set-Impresora {
             $bd = Read-Host ' Baudios [9600]'
             $cfg.Modo = 'com'; $cfg.Puerto = $p.Trim().ToUpper(); $cfg.Baudios = $(if ($bd -match '^\d+$') { [int]$bd } else { 9600 })
         }
-        '3' { $cfg.Modo = 'ninguna' }
+        '4' { $cfg.Modo = 'ninguna' }
         default { return }
     }
     $neg = Read-Host " Nombre del negocio para el ticket (ENTER = '$($cfg.Negocio)')"
