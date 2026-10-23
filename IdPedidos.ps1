@@ -192,16 +192,24 @@ public class IdPedidosBtEndPoint : EndPoint {
     public override EndPoint Create(SocketAddress sa) { return this; }
 }
 public static class IdPedidosBluetooth {
-    public static void Send(string mac, byte[] data, int timeoutMs) {
+    static Socket Connect(string mac, int timeoutMs) {
         ulong addr = Convert.ToUInt64(mac.Replace(":", "").Replace("-", ""), 16);
-        using (Socket s = new Socket((AddressFamily)32, SocketType.Stream, (ProtocolType)3)) {
-            IAsyncResult r = s.BeginConnect(new IdPedidosBtEndPoint(addr), null, null);
-            if (!r.AsyncWaitHandle.WaitOne(timeoutMs)) { s.Close(); throw new Exception("El dispositivo Bluetooth no respondio (esta encendido y cerca?)"); }
-            s.EndConnect(r);
+        Socket s = new Socket((AddressFamily)32, SocketType.Stream, (ProtocolType)3);
+        IAsyncResult r = s.BeginConnect(new IdPedidosBtEndPoint(addr), null, null);
+        if (!r.AsyncWaitHandle.WaitOne(timeoutMs)) { s.Close(); throw new Exception("El dispositivo Bluetooth no respondio (esta encendido y cerca?)"); }
+        try { s.EndConnect(r); } catch { s.Close(); throw; }
+        return s;
+    }
+    public static void Send(string mac, byte[] data, int timeoutMs) {
+        using (Socket s = Connect(mac, timeoutMs)) {
             s.Send(data);
             System.Threading.Thread.Sleep(800);
             s.Shutdown(SocketShutdown.Both);
         }
+    }
+    // Solo conecta y desconecta, sin imprimir nada
+    public static void Test(string mac, int timeoutMs) {
+        using (Socket s = Connect(mac, timeoutMs)) { s.Shutdown(SocketShutdown.Both); }
     }
 }
 '@
@@ -228,6 +236,22 @@ function Get-BluetoothEmparejados {
         } catch { }
     }
     return @($lista | Sort-Object Mac -Unique)
+}
+
+# Comprueba (sin imprimir) que la impresora responde; el resultado se muestra en el encabezado
+$script:EstadoImpresora = ''
+function Test-Impresora {
+    $cfg = Get-Config
+    switch ($cfg.Modo) {
+        'bt' {
+            Write-Host (' Conectando con {0}...' -f $cfg.BluetoothNombre) -ForegroundColor DarkGray
+            try { [IdPedidosBluetooth]::Test($cfg.Bluetooth, 8000); $script:EstadoImpresora = "OK|$($cfg.BluetoothNombre): conectada" }
+            catch { $script:EstadoImpresora = "ERR|$($cfg.BluetoothNombre): no responde (enciende el Bluetooth del aparato y escribe P)" }
+        }
+        'windows' { $script:EstadoImpresora = "OK|$($cfg.Impresora)" }
+        'com'     { $script:EstadoImpresora = "OK|$($cfg.Puerto)" }
+        default   { $script:EstadoImpresora = 'ERR|Sin impresora (escribe I para configurarla)' }
+    }
 }
 
 function Remove-Acentos([string]$s) {
@@ -402,11 +426,17 @@ function Show-Encabezado {
     Write-Host '                 ID PEDIDOS  -  DESPACHOS' -ForegroundColor White
     Write-Host ('                 Hoy: {0}' -f $hoy.ToString('dddd dd/MM/yyyy', [Globalization.CultureInfo]'es-ES')) -ForegroundColor Gray
     Write-Host '==============================================================' -ForegroundColor Cyan
+    if ($script:EstadoImpresora) {
+        $ok = $script:EstadoImpresora.StartsWith('OK|')
+        Write-Host ' Impresora: ' -NoNewline -ForegroundColor Gray
+        Write-Host $script:EstadoImpresora.Substring($(if ($ok) { 3 } else { 4 })) -ForegroundColor $(if ($ok) { 'Green' } else { 'Yellow' })
+        Write-Host '--------------------------------------------------------------' -ForegroundColor DarkCyan
+    }
     Show-Lista (Read-Day (Get-DayFile $hoy))
     Write-Host '--------------------------------------------------------------' -ForegroundColor DarkCyan
     Write-Host ' Clic derecho = pegar ID  |  ENTER vacío = usar lo copiado' -ForegroundColor DarkGray
     Write-Host ' H = historial   R = reimprimir último   B = borrar último' -ForegroundColor DarkGray
-    Write-Host ' I = impresora   L = limpiar pantalla' -ForegroundColor DarkGray
+    Write-Host ' I = configurar impresora   P = probar conexión   L = limpiar' -ForegroundColor DarkGray
     Write-Host ''
 }
 
@@ -490,6 +520,7 @@ if (-not $mutexCreado) {
 }
 
 Build-Indice
+Test-Impresora
 $diaActual = (Get-Date).Date
 Show-Encabezado
 
@@ -503,7 +534,8 @@ while ($true) {
 
     switch -Regex ($entrada.Trim()) {
         '^[hH]$' { Show-Historial; Show-Encabezado; continue }
-        '^[iI]$' { Set-Impresora; Start-Sleep -Seconds 1; Show-Encabezado; continue }
+        '^[iI]$' { Set-Impresora; Test-Impresora; Start-Sleep -Seconds 1; Show-Encabezado; continue }
+        '^[pP]$' { Test-Impresora; Show-Encabezado; continue }
         '^[lL]$' { Show-Encabezado; continue }
         '^[rR]$' {
             $regs = Read-Day (Get-DayFile (Get-Date))
@@ -520,7 +552,7 @@ while ($true) {
             continue
         }
     }
-    if ($entrada.Trim() -match '^[hHiIlLrRbB]$') { continue }
+    if ($entrada.Trim() -match '^[hHiIlLrRbBpP]$') { continue }
 
     $id = Normalize-Id $entrada
     if (-not $id) {

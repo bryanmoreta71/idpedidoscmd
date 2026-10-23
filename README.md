@@ -41,6 +41,7 @@ Al abrir se muestran solo los pedidos del día; al día siguiente la lista empie
 | `R` | Reimprimir el último ticket |
 | `B` | Borrar el último pedido (si te equivocaste de plataforma) |
 | `I` | Configurar impresora |
+| `P` | Probar conexión con la impresora |
 | `L` | Limpiar pantalla |
 
 ## Impresora térmica Bluetooth
