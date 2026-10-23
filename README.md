@@ -16,10 +16,18 @@ O con el archivo **IdPedidos.zip**: clic derecho → **Extraer todo**, y doble c
 powershell -ExecutionPolicy Bypass -File .\install.ps1
 ```
 
-El instalador:
-- Copia la app a `%LOCALAPPDATA%\IdPedidos`.
-- Crea un acceso directo en el **Escritorio** y en **Inicio de Windows** (se abre sola al encender la PC).
-- Activa "clic derecho = pegar" en la consola clásica.
+El instalador se usa **una sola vez**. Al terminar se cierra solo y abre la app (una sola ventana). Después ya puedes borrar el zip y la carpeta extraída.
+
+**Para el día a día:**
+
+| Dónde | Qué hace |
+|---|---|
+| Escritorio → **ID Pedidos** | Abre la app (si ya está abierta, la trae al frente; nunca abre dos) |
+| Escritorio → **ID Pedidos - Opciones** → `ACTIVAR inicio automatico` | Se abre sola al encender la computadora |
+| Escritorio → **ID Pedidos - Opciones** → `DESACTIVAR inicio automatico` | Ya no se abre sola |
+| Escritorio → **ID Pedidos - Opciones** → `DESINSTALAR` | Quita accesos e inicio automático (los registros se conservan) |
+
+Lo mismo aparece en el **Menú Inicio → ID Pedidos**. El inicio automático queda activado al instalar.
 
 ## Uso
 

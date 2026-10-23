@@ -49,7 +49,25 @@ Add-Type -Namespace IdPedidos -Name Native -MemberDefinition @'
 [DllImport("kernel32.dll", SetLastError = true)] public static extern IntPtr GetStdHandle(int nStdHandle);
 [DllImport("kernel32.dll", SetLastError = true)] public static extern bool GetConsoleMode(IntPtr h, out uint mode);
 [DllImport("kernel32.dll", SetLastError = true)] public static extern bool SetConsoleMode(IntPtr h, uint mode);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
 '@
+
+# Una sola ventana: si la app ya está abierta, se trae al frente y esta se cierra
+$TituloVentana = 'ID PEDIDOS - Despachos'
+$mutexCreado = $false
+$mutex = New-Object System.Threading.Mutex($true, 'Local\IdPedidosApp', [ref]$mutexCreado)
+if (-not $mutexCreado) {
+    try {
+        $h = [IdPedidos.Native]::FindWindow($null, $TituloVentana)
+        if ($h -ne [IntPtr]::Zero) {
+            [void][IdPedidos.Native]::ShowWindow($h, 9)   # SW_RESTORE
+            [void][IdPedidos.Native]::SetForegroundWindow($h)
+        }
+    } catch { }
+    exit
+}
 
 $script:Vt = $false
 try {
@@ -66,7 +84,7 @@ try {
 } catch { }
 
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
-try { $Host.UI.RawUI.WindowTitle = 'ID PEDIDOS - Despachos' } catch { }
+try { $Host.UI.RawUI.WindowTitle = $TituloVentana } catch { }
 
 $Esc = [char]27
 
@@ -618,14 +636,6 @@ function Read-Plataforma {
 # --------------------------------------------------------------------------
 # Programa principal
 # --------------------------------------------------------------------------
-$mutexCreado = $false
-$mutex = New-Object System.Threading.Mutex($true, 'Local\IdPedidosApp', [ref]$mutexCreado)
-if (-not $mutexCreado) {
-    Write-Host 'ID PEDIDOS ya está abierto en otra ventana.' -ForegroundColor Yellow
-    Start-Sleep -Seconds 3
-    exit
-}
-
 Build-Indice
 Test-Impresora
 $diaActual = (Get-Date).Date
