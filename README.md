@@ -10,7 +10,7 @@ Abre **PowerShell** y pega:
 irm https://raw.githubusercontent.com/bryanmoreta71/idpedidoscmd/main/install.ps1 | iex
 ```
 
-O, si descargaste la carpeta:
+O con el archivo **IdPedidos.zip**: clic derecho → **Extraer todo**, y doble clic en **INSTALAR.cmd**. También puedes ejecutar desde PowerShell:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install.ps1
