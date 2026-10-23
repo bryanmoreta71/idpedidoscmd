@@ -314,8 +314,27 @@ function Start-Diagnostico {
     $puertos = @([System.IO.Ports.SerialPort]::GetPortNames() | Sort-Object -Unique)
     & $linea ("Puertos COM: {0}" -f $(if ($puertos) { $puertos -join ', ' } else { 'ninguno' })) Gray
 
+    if ($cfg.Modo -eq 'com') {
+        $prueba = [pscustomobject]@{ Fecha = (Get-Date).ToString('dd/MM/yyyy'); Hora = (Get-Date).ToString('HH:mm:ss'); ID = 'PRUEBA-123'; Plataforma = 'PedidosYa' }
+        foreach ($f in @('escpos', 'texto')) {
+            $cfg.Formato = $f
+            $nombreF = $(if ($f -eq 'escpos') { 'comandos de impresora (ESC/POS)' } else { 'texto simple' })
+            Write-Host " Enviando por $($cfg.Puerto) en $nombreF..." -NoNewline
+            try { Send-Com $cfg.Puerto ([int]$cfg.Baudios) (New-Ticket $prueba $cfg); Write-Host ' enviado' -ForegroundColor Green; Write-Log "$($cfg.Puerto) / $f : enviado" }
+            catch { Write-Host " $($_.Exception.Message)" -ForegroundColor Yellow; Write-Log "$($cfg.Puerto) / $f : $($_.Exception.Message)"; continue }
+            if ((Read-Host '   ¿Salió el ticket impreso en el aparato? (S/N)') -match '^[sS]') {
+                Save-Config $cfg
+                & $linea "Funciona por $($cfg.Puerto) en $nombreF. Configuración guardada." Green
+                return
+            }
+            Write-Log "$($cfg.Puerto) / $f : enviado pero NO imprimió"
+        }
+        & $linea 'No se logró imprimir por puerto COM. Envía el archivo diagnostico.txt (se abrirá ahora).' Yellow
+        try { Start-Process notepad.exe $LogPath } catch { }
+        return
+    }
     if ($cfg.Modo -ne 'bt' -or -not $cfg.Bluetooth) {
-        & $linea 'La impresora no está en modo Bluetooth directo. Escribe I y elige 1.' Yellow
+        & $linea 'Configura primero la impresora: escribe I (opción 1 Bluetooth directo o 3 Puerto COM).' Yellow
         return
     }
     $prueba = [pscustomobject]@{ Fecha = (Get-Date).ToString('dd/MM/yyyy'); Hora = (Get-Date).ToString('HH:mm:ss'); ID = 'PRUEBA-123'; Plataforma = 'PedidosYa' }
@@ -349,6 +368,23 @@ function Start-Diagnostico {
     }
     & $linea 'No se logró imprimir. Envía el archivo diagnostico.txt (se abrirá ahora).' Yellow
     try { Start-Process notepad.exe $LogPath } catch { }
+}
+
+# Envío por puerto COM Bluetooth "saliente" (SPP)
+function Send-Com([string]$puerto, [int]$baudios, [byte[]]$bytes) {
+    if (-not $puerto) { throw 'No hay puerto COM configurado (escribe I)' }
+    $sp = New-Object System.IO.Ports.SerialPort $puerto, $baudios
+    $sp.WriteTimeout = 15000
+    $sp.Handshake = [System.IO.Ports.Handshake]::None
+    try { $sp.Open() }
+    catch { throw "no se pudo abrir $puerto ($($_.Exception.InnerException.Message)). ¿Es el puerto SALIENTE, el aparato está encendido y cerca?" }
+    try {
+        for ($i = 0; $i -lt $bytes.Length; $i += 256) {
+            $sp.Write($bytes, $i, [Math]::Min(256, $bytes.Length - $i))
+            Start-Sleep -Milliseconds 30
+        }
+        Start-Sleep -Milliseconds 2500   # dar tiempo a que el aparato imprima antes de cerrar
+    } finally { $sp.Close() }
 }
 
 # Comprueba (sin imprimir) que la impresora responde; el resultado se muestra en el encabezado
@@ -454,10 +490,8 @@ function Send-Ticket($reg) {
         } elseif ($cfg.Modo -eq 'windows') {
             [IdPedidosRawPrinter]::Send($cfg.Impresora, $bytes)
         } elseif ($cfg.Modo -eq 'com') {
-            $sp = New-Object System.IO.Ports.SerialPort $cfg.Puerto, ([int]$cfg.Baudios)
-            $sp.WriteTimeout = 5000
-            $sp.Open()
-            try { $sp.Write($bytes, 0, $bytes.Length); Start-Sleep -Milliseconds 300 } finally { $sp.Close() }
+            try { Send-Com $cfg.Puerto ([int]$cfg.Baudios) $bytes }
+            catch { Start-Sleep -Seconds 2; Send-Com $cfg.Puerto ([int]$cfg.Baudios) $bytes }   # segundo intento
         }
         Write-Host '   Impreso.' -ForegroundColor DarkGray
     } catch {
